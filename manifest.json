@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Teams Meeting ASR Assistant",
+  "version": "2.0.0",
+  "description": "Mix Teams tab audio and microphone audio, transcribe with ASR, and generate meeting minutes.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "offscreen",
+    "storage",
+    "tabCapture",
+    "tabs",
+	"activeTab"
+  ],
+  "host_permissions": [
+    "https://teams.microsoft.com/*",
+    "https://*.teams.microsoft.com/*",
+    "http://ccbdistweb.mfg.hynix-dl.com/*",
+    "https://ccbdistweb.mfg.hynix-dl.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Teams Meeting ASR Assistant",
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://ccbdistweb.mfg.hynix-dl.com wss://ccbdistweb.mfg.hynix-dl.com http://ccbdistweb.mfg.hynix-dl.com https://ccbdistweb.mfg.hynix-dl.com"
+  }
+}
