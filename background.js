@@ -64,7 +64,9 @@ async function findTeamsTab() {
   const tabs = await chrome.tabs.query({
     url: [
       "https://teams.microsoft.com/*",
-      "https://*.teams.microsoft.com/*"
+      "https://*.teams.microsoft.com/*",
+      "https://teams.cloud.microsoft/*",
+      "https://*.teams.cloud.microsoft/*"
     ]
   });
 
@@ -83,11 +85,14 @@ async function checkTeamsMeetingStatus(tab) {
   if (!tab?.url) return false;
   
   // Teams meeting URLs typically contain /l/meetingJoin/ or /meet/
+  // For both teams.microsoft.com and teams.cloud.microsoft domains
   const meetingPatterns = [
     /\/l\/meetingJoin\//i,
     /\/meet\//i,
     /[?&]meetingId=/i,
-    /[?&]otn=/i  // One-Time Numerical identifier for meetings
+    /[?&]otn=/i,  // One-Time Numerical identifier for meetings
+    /\/call\//i,  // For calls
+    /[?&]callId=/i
   ];
   
   return meetingPatterns.some(pattern => pattern.test(tab.url));
