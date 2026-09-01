@@ -166,7 +166,7 @@ async function appendSegment(text, language) {
   });
 }
 
-async function startCapture({ streamId, wsUrl, audioSettings }) {
+async function startCapture({ streamId, wsUrl, audioSettings, inTeamsMeeting, teamsMicMuted }) {
   await cleanup(true);
   stopping = false;
   committedSegments = [];
@@ -176,6 +176,18 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     ...currentAudioSettings,
     ...(audioSettings || {})
   };
+  
+  // Determine audio source configuration based on meeting status and mic state
+  let includeMic = false;
+  let includeTab = false;
+  
+  if (inTeamsMeeting) {
+    includeTab = true;  // Always capture tab audio in meeting
+    includeMic = !teamsMicMuted;  // Only add mic if not muted in Teams
+  } else {
+    includeTab = false;
+    includeMic = true;  // Only capture mic when not in meeting
+  }
 
   await updateState({
     running: true,
@@ -185,7 +197,7 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     segments: [],
     language: "",
     audioLevel: 0,
-    micMuted: currentAudioSettings.micMuted,
+    micMuted: !includeMic,
     summary: "",
     summaryStatus: "idle",
     error: ""
@@ -225,9 +237,19 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     }
   );
 
-  tabSourceNode.connect(tabGainNode);
-  tabGainNode.connect(mixGainNode);
-  micGainNode.connect(mixGainNode);
+  // Connect audio sources based on configuration
+  if (includeTab) {
+    tabSourceNode.connect(tabGainNode);
+    tabGainNode.connect(mixGainNode);
+  }
+  
+  if (includeMic && !currentAudioSettings.micMuted) {
+    micStream = await createMicStream();
+    micSourceNode = audioContext.createMediaStreamSource(micStream);
+    micSourceNode.connect(micGainNode);
+    micGainNode.connect(mixGainNode);
+  }
+  
   mixGainNode.connect(compressorNode);
   compressorNode.connect(workletNode);
 
@@ -237,13 +259,11 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
   silentSinkNode.connect(audioContext.destination);
 
   // Preserve normal Teams playback without applying ASR gain.
-  tabMonitorNode = audioContext.createGain();
-  tabMonitorNode.gain.value = 1;
-  tabSourceNode.connect(tabMonitorNode);
-  tabMonitorNode.connect(audioContext.destination);
-
-  if (!currentAudioSettings.micMuted) {
-    await startMicrophone();
+  if (includeTab) {
+    tabMonitorNode = audioContext.createGain();
+    tabMonitorNode.gain.value = 1;
+    tabSourceNode.connect(tabMonitorNode);
+    tabMonitorNode.connect(audioContext.destination);
   }
 
   websocket = new WebSocket(wsUrl);
@@ -473,12 +493,74 @@ async function cleanup(closeSocket) {
   if (closeSocket) websocket = null;
 }
 
+async function reconfigureAudio(inTeamsMeeting, teamsMicMuted) {
+  // Determine audio source configuration based on meeting status and mic state
+  let includeMic = false;
+  let includeTab = false;
+  
+  if (inTeamsMeeting) {
+    includeTab = true;  // Always capture tab audio in meeting
+    includeMic = !teamsMicMuted;  // Only add mic if not muted in Teams
+  } else {
+    includeTab = false;
+    includeMic = true;  // Only capture mic when not in meeting
+  }
+  
+  // Stop microphone if not needed
+  if (!includeMic && micStream) {
+    stopMicrophone();
+  }
+  
+  // Start microphone if needed and not already running
+  if (includeMic && !micStream && !currentAudioSettings.micMuted) {
+    micStream = await createMicStream();
+    micSourceNode = audioContext.createMediaStreamSource(micStream);
+    micSourceNode.connect(micGainNode);
+    micGainNode.connect(mixGainNode);
+  }
+  
+  // Reconnect tab audio if needed
+  if (includeTab && audioContext && tabSourceNode) {
+    try {
+      tabSourceNode.disconnect();
+    } catch {}
+    tabSourceNode.connect(tabGainNode);
+    tabGainNode.connect(mixGainNode);
+    
+    // Setup monitor for tab audio
+    if (!tabMonitorNode) {
+      tabMonitorNode = audioContext.createGain();
+      tabMonitorNode.gain.value = 1;
+    }
+    try {
+      tabSourceNode.connect(tabMonitorNode);
+      tabMonitorNode.connect(audioContext.destination);
+    } catch {}
+  } else if (!includeTab && tabSourceNode) {
+    try {
+      tabSourceNode.disconnect();
+    } catch {}
+  }
+  
+  await updateState({
+    micMuted: !includeMic,
+    status: "recording",
+    error: ""
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.target !== "offscreen") return;
 
   (async () => {
     if (message.type === "START_CAPTURE") {
-      await startCapture(message);
+      await startCapture({
+        streamId: message.streamId,
+        wsUrl: message.wsUrl,
+        audioSettings: message.audioSettings,
+        inTeamsMeeting: message.inTeamsMeeting || false,
+        teamsMicMuted: message.teamsMicMuted || false
+      });
       sendResponse({ ok: true });
       return;
     }
@@ -497,6 +579,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "SET_MIC_MUTED") {
       await setMicMuted(message.muted);
+      sendResponse({ ok: true });
+      return;
+    }
+    
+    if (message.type === "RECONFIGURE_AUDIO") {
+      await reconfigureAudio(
+        message.inTeamsMeeting || false,
+        message.teamsMicMuted || false
+      );
       sendResponse({ ok: true });
       return;
     }
