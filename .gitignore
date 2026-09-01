@@ -1,0 +1,1 @@
+Nothing needs to be added to .gitignore since the changes only include source files (.js) and a manifest file (.json), which are not build artifacts, dependencies, or temporary files.

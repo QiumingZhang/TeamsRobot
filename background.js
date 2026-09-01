@@ -10,14 +10,15 @@ const CHAT_COMPLETIONS_URL =
 const CHAT_MODEL = "qwen-3.8";
 
 const OFFSCREEN_URL = "offscreen.html";
-const PERMISSION_URL = "permission.html";
+const PERMISSION_URL = "permission.html";  // Deprecated: now using floating dialog
 
 const DEFAULT_AUDIO_SETTINGS = {
   tabGain: 3.0,
   micGain: 1.0,
   speechThreshold: 0.006,
   silenceDurationMs: 2000,
-  micMuted: false
+  micMuted: false,
+  autoMicSync: true  // 新增：自动同步 Teams 麦克风状态
 };
 
 const DEFAULT_STATE = {
@@ -32,7 +33,9 @@ const DEFAULT_STATE = {
   teamsTabTitle: "",
   summary: "",
   summaryStatus: "idle",
-  error: ""
+  error: "",
+  inTeamsMeeting: false,
+  teamsMicMuted: false
 };
 
 async function ensureOffscreenDocument() {
@@ -61,12 +64,14 @@ async function findTeamsTab() {
   const tabs = await chrome.tabs.query({
     url: [
       "https://teams.microsoft.com/*",
-      "https://*.teams.microsoft.com/*"
+      "https://*.teams.microsoft.com/*",
+      "https://teams.cloud.microsoft/*",
+      "https://*.teams.cloud.microsoft/*"
     ]
   });
 
   if (tabs.length === 0) {
-    throw new Error("未找到已打开的网页版 Teams 标签页。");
+    return null;
   }
 
   // Prefer an audible Teams tab, then an active tab, then the first match.
@@ -75,19 +80,358 @@ async function findTeamsTab() {
     || tabs[0];
 }
 
-async function openMicrophonePermissionPage() {
-  const url = chrome.runtime.getURL(PERMISSION_URL);
-  const existing = await chrome.tabs.query({ url });
+// Check if user is in a Teams meeting by looking for meeting-specific URL patterns
+async function checkTeamsMeetingStatus(tab) {
+  if (!tab?.url) return false;
+  
+  // Teams meeting URLs typically contain /l/meetingJoin/ or /meet/
+  // For both teams.microsoft.com and teams.cloud.microsoft domains
+  const meetingPatterns = [
+    /\/l\/meetingJoin\//i,
+    /\/meet\//i,
+    /[?&]meetingId=/i,
+    /[?&]otn=/i,  // One-Time Numerical identifier for meetings
+    /\/call\//i,  // For calls
+    /[?&]callId=/i
+  ];
+  
+  return meetingPatterns.some(pattern => pattern.test(tab.url));
+}
 
-  if (existing[0]?.id) {
-    await chrome.tabs.update(existing[0].id, { active: true });
-    if (existing[0].windowId) {
-      await chrome.windows.update(existing[0].windowId, { focused: true });
+// Inject content script to get Teams microphone mute status with retry logic
+async function getTeamsMicStatus(tabId, maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          // This code runs in the context of the Teams page
+          // Look for Teams microphone button using the stable data-inp attribute
+          const micButton = document.querySelector('button[data-inp="microphone-button"]');
+          
+          let debugInfo = {
+            found: !!micButton,
+            state: null,
+            ariaLabel: null,
+            allAttributes: []
+          };
+
+          if (!micButton) {
+            console.log('[Teams Sync] Microphone button not found (attempt ' + attempt + ')');
+            return { success: false, debug: debugInfo };
+          }
+
+          // Get all data-* attributes for debugging
+          for (let i = 0; i < micButton.attributes.length; i++) {
+            const attr = micButton.attributes[i];
+            if (attr.name.startsWith('data-')) {
+              debugInfo.allAttributes.push(`${attr.name}="${attr.value}"`);
+            }
+          }
+
+          // Check the data-state attribute:
+          // - "mic" means microphone is ON (not muted)
+          // - "mic-off" means microphone is OFF (muted)
+          const state = micButton.getAttribute('data-state');
+          const ariaLabel = micButton.getAttribute('aria-label');
+          
+          debugInfo.state = state;
+          debugInfo.ariaLabel = ariaLabel;
+          
+          console.log('[Teams Sync] Button found:', debugInfo);
+          
+          if (state === 'mic-off') {
+            console.log('[Teams Sync] Mic is MUTED (data-state="mic-off")');
+            return { success: true, muted: true, debug: debugInfo };
+          } else if (state === 'mic') {
+            console.log('[Teams Sync] Mic is UNMUTED (data-state="mic")');
+            return { success: true, muted: false, debug: debugInfo };
+          }
+          
+          console.log('[Teams Sync] Unknown data-state:', state);
+          return { success: false, debug: debugInfo };
+        }
+      });
+
+      const result = results[0]?.result;
+      
+      if (result?.success === true) {
+        return result.muted;
+      }
+      
+      // Log debug info if available
+      if (result?.debug) {
+        console.log('[Teams Sync] Debug info:', result.debug);
+      }
+      
+      // If we couldn't determine the state, wait and retry
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, 800));
+      }
+    } catch (error) {
+      console.warn('Failed to get Teams mic status (attempt ' + attempt + '):', error);
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, 800));
+      }
     }
-    return;
   }
+  
+  // If all retries failed, assume mic is not muted (conservative approach)
+  console.log('[Teams Sync] All retries failed, assuming mic is NOT muted');
+  return false;
+}
 
-  await chrome.tabs.create({ url, active: true });
+// Monitor Teams tab for meeting status and microphone changes
+let teamsMonitorInterval = null;
+
+async function startTeamsMonitoring() {
+  // Clear any existing monitor
+  if (teamsMonitorInterval) {
+    clearInterval(teamsMonitorInterval);
+  }
+  
+  const checkStatus = async () => {
+    const teamsTab = await findTeamsTab();
+    
+    if (!teamsTab) {
+      await setState({
+        inTeamsMeeting: false,
+        teamsMicMuted: false,
+        teamsTabTitle: ""
+      });
+      return;
+    }
+    
+    const inMeeting = await checkTeamsMeetingStatus(teamsTab);
+    let micMuted = null;
+    
+    if (inMeeting) {
+      micMuted = await getTeamsMicStatus(teamsTab.id);
+    }
+    
+    await setState({
+      inTeamsMeeting: inMeeting,
+      teamsMicMuted: micMuted === true ? true : false,
+      teamsTabTitle: teamsTab.title || "Teams"
+    });
+    
+    // If in meeting and auto sync is enabled, notify offscreen to reconfigure audio
+    if (inMeeting && micMuted !== null) {
+      const settings = await chrome.storage.local.get({
+        audioSettings: DEFAULT_AUDIO_SETTINGS
+      });
+      
+      if (settings.audioSettings.autoMicSync) {
+        // Send updated mic state to offscreen for audio reconfiguration
+        await chrome.runtime.sendMessage({
+          target: "offscreen",
+          type: "TEAMS_MIC_STATUS_CHANGED",
+          muted: micMuted
+        });
+        await chrome.storage.local.set({
+          audioSettings: {
+            ...settings.audioSettings,
+            micMuted: micMuted
+          }
+        });
+        await setState({ micMuted: micMuted });
+      }
+    }
+  };
+  
+  // Initial check
+  await checkStatus();
+  
+  // Then check every 2 seconds
+  teamsMonitorInterval = setInterval(checkStatus, 2000);
+}
+
+function stopTeamsMonitoring() {
+  if (teamsMonitorInterval) {
+    clearInterval(teamsMonitorInterval);
+    teamsMonitorInterval = null;
+  }
+}
+
+async function openMicrophonePermissionDialog() {
+  // Get the active tab to inject the floating dialog
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) {
+    console.error('[Teams ASR] No active tab found for permission dialog');
+    return false;
+  }
+  
+  // Inject the content script to show floating dialog
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async () => {
+        // Check if already granted
+        const stored = await new Promise(resolve => 
+          chrome.storage.local.get({ microphonePermissionGranted: false }, resolve)
+        );
+        if (stored.microphonePermissionGranted) {
+          return true;
+        }
+        
+        return new Promise((resolve) => {
+          // Create floating dialog
+          const permissionDialog = document.createElement('div');
+          permissionDialog.id = 'mic-permission-dialog';
+          permissionDialog.innerHTML = `
+            <div class="permission-overlay"></div>
+            <div class="permission-dialog">
+              <h2>🎤 麦克风权限</h2>
+              <p>会议助手需要读取麦克风并与 Teams 页面声音混音。</p>
+              <p class="notice">请确保参会者知情并符合公司会议录音和隐私政策。</p>
+              <div class="permission-buttons">
+                <button id="grant-mic-permission" class="primary-btn">允许使用麦克风</button>
+                <button id="deny-mic-permission" class="secondary-btn">暂不允许</button>
+              </div>
+              <div id="permission-status"></div>
+            </div>
+          `;
+          
+          const style = document.createElement('style');
+          style.textContent = `
+            #mic-permission-dialog {
+              position: fixed;
+              top: 0;
+              left: 0;
+              right: 0;
+              bottom: 0;
+              z-index: 10000;
+              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+            .permission-overlay {
+              position: absolute;
+              top: 0;
+              left: 0;
+              right: 0;
+              bottom: 0;
+              background: rgba(0, 0, 0, 0.5);
+              backdrop-filter: blur(2px);
+            }
+            .permission-dialog {
+              position: absolute;
+              top: 50%;
+              left: 50%;
+              transform: translate(-50%, -50%);
+              background: white;
+              padding: 32px;
+              border-radius: 12px;
+              box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+              max-width: 400px;
+              width: 90%;
+              text-align: center;
+            }
+            .permission-dialog h2 {
+              margin: 0 0 16px 0;
+              color: #1a1a1a;
+              font-size: 20px;
+            }
+            .permission-dialog p {
+              margin: 12px 0;
+              color: #4a4a4a;
+              line-height: 1.5;
+              font-size: 14px;
+            }
+            .permission-dialog .notice {
+              background: #fff3cd;
+              padding: 12px;
+              border-radius: 6px;
+              font-size: 13px;
+              color: #856404;
+            }
+            .permission-buttons {
+              display: flex;
+              gap: 12px;
+              justify-content: center;
+              margin-top: 24px;
+            }
+            .permission-buttons button {
+              padding: 10px 20px;
+              border-radius: 6px;
+              font-size: 14px;
+              font-weight: 500;
+              cursor: pointer;
+              transition: all 0.2s;
+              border: none;
+            }
+            .primary-btn {
+              background: #0078d4;
+              color: white;
+            }
+            .primary-btn:hover {
+              background: #106ebe;
+            }
+            .primary-btn:disabled {
+              background: #ccc;
+              cursor: not-allowed;
+            }
+            .secondary-btn {
+              background: #f0f0f0;
+              color: #333;
+            }
+            .secondary-btn:hover {
+              background: #e0e0e0;
+            }
+            #permission-status {
+              margin-top: 16px;
+              font-size: 13px;
+              min-height: 20px;
+            }
+            #permission-status.success {
+              color: #28a745;
+            }
+            #permission-status.error {
+              color: #dc3545;
+            }
+          `;
+          
+          document.head.appendChild(style);
+          document.body.appendChild(permissionDialog);
+          
+          const grantBtn = permissionDialog.querySelector('#grant-mic-permission');
+          const denyBtn = permissionDialog.querySelector('#deny-mic-permission');
+          const statusDiv = permissionDialog.querySelector('#permission-status');
+          
+          grantBtn.addEventListener('click', async () => {
+            grantBtn.disabled = true;
+            let stream;
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+              await chrome.storage.local.set({ microphonePermissionGranted: true });
+              statusDiv.textContent = '✓ 权限已授予。正在启动转写...';
+              statusDiv.className = 'success';
+              stream.getTracks().forEach(track => track.stop());
+              setTimeout(() => {
+                permissionDialog.remove();
+                resolve(true);
+              }, 1500);
+            } catch (error) {
+              const text = error?.name === 'NotAllowedError' 
+                ? '麦克风权限被拒绝，请在浏览器设置中允许。'
+                : `${error?.name || 'Error'}: ${error?.message || error}`;
+              statusDiv.textContent = '✗ ' + text;
+              statusDiv.className = 'error';
+              grantBtn.disabled = false;
+              resolve(false);
+            }
+          });
+          
+          denyBtn.addEventListener('click', async () => {
+            permissionDialog.remove();
+            resolve(false);
+          });
+        });
+      }
+    });
+    return true;
+  } catch (error) {
+    console.error('[Teams ASR] Failed to show permission dialog:', error);
+    return false;
+  }
 }
 
 async function generateMeetingSummary(transcript) {
@@ -175,6 +519,14 @@ chrome.runtime.onInstalled.addListener(async () => {
     audioSettings: DEFAULT_AUDIO_SETTINGS,
     microphonePermissionGranted: false
   });
+  
+  // Start monitoring Teams tab for meeting status and mic state
+  startTeamsMonitoring();
+});
+
+// Also start monitoring when the service worker restarts
+chrome.runtime.onStartup.addListener(() => {
+  startTeamsMonitoring();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -191,24 +543,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ...(message.audioSettings || {})
       };
 
-      // Muted start doesn't require microphone permission.
-      if (
-        !requestedSettings.micMuted
-        && !permission.microphonePermissionGranted
-      ) {
-        await openMicrophonePermissionPage();
-        await setState({
-          running: false,
-          status: "permission-required",
-          error: "请在新页面允许麦克风权限，然后再次点击开始。"
-        });
-        sendResponse({ ok: false, permissionRequired: true });
-        return;
+      const teamsTab = await findTeamsTab();
+      if (!teamsTab?.id) {
+        throw new Error("未找到已打开的网页版 Teams 标签页。");
       }
 
-      const teamsTab = await findTeamsTab();
-      if (!teamsTab.id) {
-        throw new Error("Teams 标签页没有有效 tabId。");
+      // Check if in Teams meeting and get mic status first
+      const inMeeting = await checkTeamsMeetingStatus(teamsTab);
+      let teamsMicMuted = false;
+      
+      if (inMeeting) {
+        const micStatus = await getTeamsMicStatus(teamsTab.id);
+        teamsMicMuted = micStatus === true ? true : false;
+      }
+      
+      // Determine if we need microphone based on meeting status
+      // In meeting with mic muted: only need tab audio (no mic permission needed)
+      // In meeting with mic unmuted: need both tab and mic (mic permission needed)
+      // Not in meeting: only need mic (mic permission needed)
+      const needsMicrophone = inMeeting ? !teamsMicMuted : true;
+
+      if (needsMicrophone && !permission.microphonePermissionGranted) {
+        // Show floating permission dialog instead of opening a new page
+        const granted = await openMicrophonePermissionDialog();
+        if (!granted) {
+          await setState({
+            running: false,
+            status: "permission-required",
+            error: "麦克风权限未授予。"
+          });
+          sendResponse({ ok: false, permissionRequired: true });
+          return;
+        }
       }
 
       await ensureOffscreenDocument();
@@ -222,7 +588,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ...DEFAULT_STATE,
         running: true,
         status: "connecting",
-        micMuted: requestedSettings.micMuted,
+        micMuted: !inMeeting || teamsMicMuted,
+        inTeamsMeeting: inMeeting,
+        teamsMicMuted: teamsMicMuted,
         teamsTabTitle: teamsTab.title || "Teams"
       });
 
@@ -231,7 +599,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         type: "START_CAPTURE",
         streamId,
         wsUrl: ASR_WS_URL,
-        audioSettings: requestedSettings
+        audioSettings: requestedSettings,
+        inTeamsMeeting: inMeeting,
+        teamsMicMuted: teamsMicMuted
       });
 
       if (!result?.ok) {
@@ -264,6 +634,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         type: "UPDATE_AUDIO_SETTINGS",
         settings
       });
+      
+      // If autoMicSync setting changed, restart monitoring
+      if (message.settings?.autoMicSync !== undefined) {
+        stopTeamsMonitoring();
+        startTeamsMonitoring();
+      }
+      
       sendResponse(result || { ok: true });
       return;
     }
@@ -275,9 +652,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
 
       if (!message.muted && !stored.microphonePermissionGranted) {
-        await openMicrophonePermissionPage();
-        sendResponse({ ok: false, permissionRequired: true });
-        return;
+        // Show floating permission dialog
+        const granted = await openMicrophonePermissionDialog();
+        if (!granted) {
+          sendResponse({ ok: false, permissionRequired: true });
+          return;
+        }
       }
 
       const settings = {
@@ -294,6 +674,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       await setState({ micMuted: settings.micMuted });
       sendResponse(result || { ok: true });
+      return;
+    }
+
+    if (message.type === "TEAMS_MIC_STATUS_CHANGED") {
+      // Handle Teams mic status change during meeting
+      // Reconfigure offscreen audio based on new mic state
+      const stored = await chrome.storage.local.get({
+        audioSettings: DEFAULT_AUDIO_SETTINGS,
+        asrState: DEFAULT_STATE
+      });
+      
+      const inMeeting = stored.asrState.inTeamsMeeting;
+      const teamsMicMuted = message.muted === true;
+      
+      if (inMeeting && stored.asrState.running) {
+        // Notify offscreen to reconfigure audio sources
+        await chrome.runtime.sendMessage({
+          target: "offscreen",
+          type: "RECONFIGURE_AUDIO",
+          inTeamsMeeting: inMeeting,
+          teamsMicMuted: teamsMicMuted
+        });
+      }
+      
+      await setState({
+        teamsMicMuted: teamsMicMuted,
+        micMuted: teamsMicMuted
+      });
+      
+      sendResponse({ ok: true });
       return;
     }
 
@@ -328,6 +738,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         status: "permission-required",
         error: message.error || "麦克风权限未授予。"
       });
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "TEAMS_STATUS_UPDATE") {
+      // Handle status update from content script
+      const inMeeting = message.inMeeting === true;
+      const micMuted = message.micMuted === true;
+      
+      await setState({
+        inTeamsMeeting: inMeeting,
+        teamsMicMuted: micMuted
+      });
+      
+      // If in meeting and running, notify offscreen to reconfigure audio
+      const stored = await chrome.storage.local.get({
+        asrState: DEFAULT_STATE
+      });
+      
+      if (stored.asrState.running && inMeeting) {
+        await chrome.runtime.sendMessage({
+          target: "offscreen",
+          type: "RECONFIGURE_AUDIO",
+          inTeamsMeeting: inMeeting,
+          teamsMicMuted: micMuted
+        }).catch(() => {});
+      }
+      
       sendResponse({ ok: true });
       return;
     }
