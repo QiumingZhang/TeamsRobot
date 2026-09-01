@@ -14,6 +14,7 @@ const tabGain = $("#tabGain");
 const micGain = $("#micGain");
 const threshold = $("#speechThreshold");
 const silenceDuration = $("#silenceDuration");
+const autoMicSyncCheckbox = $("#autoMicSync");
 const tabGainValue = $("#tabGainValue");
 const micGainValue = $("#micGainValue");
 const thresholdValue = $("#thresholdValue");
@@ -24,7 +25,8 @@ const DEFAULT_SETTINGS = {
   micGain: 1.0,
   speechThreshold: 0.006,
   silenceDurationMs: 2000,
-  micMuted: false
+  micMuted: false,
+  autoMicSync: true
 };
 
 const DEFAULT_STATE = {
@@ -39,7 +41,9 @@ const DEFAULT_STATE = {
   teamsTabTitle: "",
   summary: "",
   summaryStatus: "idle",
-  error: ""
+  error: "",
+  inTeamsMeeting: false,
+  teamsMicMuted: false
 };
 
 const STATUS_TEXT = {
@@ -79,7 +83,8 @@ function readSettings() {
     micGain: Number(micGain.value),
     speechThreshold: Number(threshold.value),
     silenceDurationMs: Number(silenceDuration.value),
-    micMuted: muteMicButton.dataset.muted === "true"
+    micMuted: muteMicButton.dataset.muted === "true",
+    autoMicSync: autoMicSyncCheckbox.checked
   };
 }
 
@@ -89,6 +94,7 @@ function renderSettings(settings) {
   micGain.value = String(safe.micGain);
   threshold.value = String(safe.speechThreshold);
   silenceDuration.value = String(safe.silenceDurationMs);
+  autoMicSyncCheckbox.checked = Boolean(safe.autoMicSync);
   muteMicButton.dataset.muted = String(Boolean(safe.micMuted));
   muteMicButton.textContent = safe.micMuted ? "恢复麦克风" : "静音麦克风";
   muteMicButton.classList.toggle("muted", safe.micMuted);
@@ -202,6 +208,14 @@ for (const control of [tabGain, micGain, threshold, silenceDuration]) {
     });
   });
 }
+
+// Auto mic sync checkbox listener
+autoMicSyncCheckbox.addEventListener("change", () => {
+  saveAndSendSettings().catch((error) => {
+    errorBox.hidden = false;
+    errorBox.textContent = error?.message || String(error);
+  });
+});
 
 $("#copyTranscript").addEventListener("click", (event) => {
   copyText(transcript.value, event.currentTarget);

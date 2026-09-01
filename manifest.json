@@ -9,7 +9,8 @@
     "storage",
     "tabCapture",
     "tabs",
-	"activeTab"
+    "scripting",
+    "activeTab"
   ],
   "host_permissions": [
     "https://teams.microsoft.com/*",

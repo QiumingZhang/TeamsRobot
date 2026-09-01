@@ -17,7 +17,8 @@ const DEFAULT_AUDIO_SETTINGS = {
   micGain: 1.0,
   speechThreshold: 0.006,
   silenceDurationMs: 2000,
-  micMuted: false
+  micMuted: false,
+  autoMicSync: true  // 新增：自动同步 Teams 麦克风状态
 };
 
 const DEFAULT_STATE = {
@@ -32,7 +33,9 @@ const DEFAULT_STATE = {
   teamsTabTitle: "",
   summary: "",
   summaryStatus: "idle",
-  error: ""
+  error: "",
+  inTeamsMeeting: false,
+  teamsMicMuted: false
 };
 
 async function ensureOffscreenDocument() {
@@ -66,13 +69,152 @@ async function findTeamsTab() {
   });
 
   if (tabs.length === 0) {
-    throw new Error("未找到已打开的网页版 Teams 标签页。");
+    return null;
   }
 
   // Prefer an audible Teams tab, then an active tab, then the first match.
   return tabs.find((tab) => tab.audible)
     || tabs.find((tab) => tab.active)
     || tabs[0];
+}
+
+// Check if user is in a Teams meeting by looking for meeting-specific URL patterns
+async function checkTeamsMeetingStatus(tab) {
+  if (!tab?.url) return false;
+  
+  // Teams meeting URLs typically contain /l/meetingJoin/ or /meet/
+  const meetingPatterns = [
+    /\/l\/meetingJoin\//i,
+    /\/meet\//i,
+    /[?&]meetingId=/i,
+    /[?&]otn=/i  // One-Time Numerical identifier for meetings
+  ];
+  
+  return meetingPatterns.some(pattern => pattern.test(tab.url));
+}
+
+// Inject content script to get Teams microphone mute status
+async function getTeamsMicStatus(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        // This code runs in the context of the Teams page
+        // Look for Teams microphone button state
+        const micButtons = document.querySelectorAll('[data-tid="toggle-mute"], button[aria-label*="mute"], button[title*="mute"]');
+        
+        for (const btn of micButtons) {
+          // Check if the button indicates muted state
+          const ariaLabel = btn.getAttribute('aria-label') || '';
+          const title = btn.getAttribute('title') || '';
+          const className = btn.className || '';
+          
+          // Teams uses aria-label like "Turn off microphone" when unmuted, 
+          // and "Turn on microphone" when muted
+          if (ariaLabel.toLowerCase().includes('turn on')) {
+            return true; // Mic is muted
+          }
+          if (ariaLabel.toLowerCase().includes('turn off')) {
+            return false; // Mic is not muted
+          }
+          
+          // Check for visual indicators in class names
+          if (className.includes('muted') || className.includes('off')) {
+            return true;
+          }
+        }
+        
+        // Alternative: look for audio elements and their muted state
+        const audioElements = document.querySelectorAll('audio');
+        for (const audio of audioElements) {
+          if (audio.muted) {
+            return true;
+          }
+        }
+        
+        return null; // Cannot determine
+      }
+    });
+    
+    return results[0]?.result ?? null;
+  } catch (error) {
+    console.warn('Failed to get Teams mic status:', error);
+    return null;
+  }
+}
+
+// Monitor Teams tab for meeting status and microphone changes
+let teamsMonitorInterval = null;
+
+async function startTeamsMonitoring() {
+  // Clear any existing monitor
+  if (teamsMonitorInterval) {
+    clearInterval(teamsMonitorInterval);
+  }
+  
+  const checkStatus = async () => {
+    const teamsTab = await findTeamsTab();
+    
+    if (!teamsTab) {
+      await setState({
+        inTeamsMeeting: false,
+        teamsMicMuted: false,
+        teamsTabTitle: ""
+      });
+      return;
+    }
+    
+    const inMeeting = await checkTeamsMeetingStatus(teamsTab);
+    let micMuted = null;
+    
+    if (inMeeting) {
+      micMuted = await getTeamsMicStatus(teamsTab.id);
+    }
+    
+    await setState({
+      inTeamsMeeting: inMeeting,
+      teamsMicMuted: micMuted === true ? true : false,
+      teamsTabTitle: teamsTab.title || "Teams"
+    });
+    
+    // If in meeting and auto sync is enabled, sync mic state
+    if (inMeeting && micMuted !== null) {
+      const settings = await chrome.storage.local.get({
+        audioSettings: DEFAULT_AUDIO_SETTINGS
+      });
+      
+      if (settings.audioSettings.autoMicSync) {
+        // Sync Teams mic state to plugin's mic state
+        const currentMicMuted = settings.audioSettings.micMuted;
+        if (currentMicMuted !== micMuted) {
+          await chrome.runtime.sendMessage({
+            target: "offscreen",
+            type: "SET_MIC_MUTED",
+            muted: micMuted
+          });
+          await chrome.storage.local.set({
+            audioSettings: {
+              ...settings.audioSettings,
+              micMuted: micMuted
+            }
+          });
+        }
+      }
+    }
+  };
+  
+  // Initial check
+  await checkStatus();
+  
+  // Then check every 2 seconds
+  teamsMonitorInterval = setInterval(checkStatus, 2000);
+}
+
+function stopTeamsMonitoring() {
+  if (teamsMonitorInterval) {
+    clearInterval(teamsMonitorInterval);
+    teamsMonitorInterval = null;
+  }
 }
 
 async function openMicrophonePermissionPage() {
@@ -175,6 +317,14 @@ chrome.runtime.onInstalled.addListener(async () => {
     audioSettings: DEFAULT_AUDIO_SETTINGS,
     microphonePermissionGranted: false
   });
+  
+  // Start monitoring Teams tab for meeting status and mic state
+  startTeamsMonitoring();
+});
+
+// Also start monitoring when the service worker restarts
+chrome.runtime.onStartup.addListener(() => {
+  startTeamsMonitoring();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -217,12 +367,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         targetTabId: teamsTab.id
       });
 
+      // Check if in Teams meeting and sync mic state
+      const inMeeting = await checkTeamsMeetingStatus(teamsTab);
+      let initialMicMuted = requestedSettings.micMuted;
+      
+      if (inMeeting && requestedSettings.autoMicSync) {
+        const teamsMicStatus = await getTeamsMicStatus(teamsTab.id);
+        if (teamsMicStatus !== null) {
+          initialMicMuted = teamsMicStatus;
+          requestedSettings.micMuted = teamsMicStatus;
+        }
+      }
+
       await chrome.storage.local.set({ audioSettings: requestedSettings });
       await setState({
         ...DEFAULT_STATE,
         running: true,
         status: "connecting",
-        micMuted: requestedSettings.micMuted,
+        micMuted: initialMicMuted,
+        inTeamsMeeting: inMeeting,
+        teamsMicMuted: initialMicMuted,
         teamsTabTitle: teamsTab.title || "Teams"
       });
 
@@ -264,6 +428,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         type: "UPDATE_AUDIO_SETTINGS",
         settings
       });
+      
+      // If autoMicSync setting changed, restart monitoring
+      if (message.settings?.autoMicSync !== undefined) {
+        stopTeamsMonitoring();
+        startTeamsMonitoring();
+      }
+      
       sendResponse(result || { ok: true });
       return;
     }
@@ -278,6 +449,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await openMicrophonePermissionPage();
         sendResponse({ ok: false, permissionRequired: true });
         return;
+      }
+
+      // If autoMicSync is enabled and user is in a Teams meeting, 
+      // prevent manual override or warn user
+      const currentState = await chrome.storage.local.get({ asrState: DEFAULT_STATE });
+      if (stored.audioSettings.autoMicSync && currentState.asrState.inTeamsMeeting) {
+        console.log('Auto mic sync is active. Manual mute override may be reverted by Teams status.');
       }
 
       const settings = {
