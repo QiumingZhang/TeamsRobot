@@ -254,9 +254,184 @@ function stopTeamsMonitoring() {
 }
 
 async function openMicrophonePermissionDialog() {
-  // Import the floating permission dialog module
-  const { requestMicrophonePermission } = await import(chrome.runtime.getURL('permission_floating.js'));
-  return await requestMicrophonePermission();
+  // Get the active tab to inject the floating dialog
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) {
+    console.error('[Teams ASR] No active tab found for permission dialog');
+    return false;
+  }
+  
+  // Inject the content script to show floating dialog
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async () => {
+        // Check if already granted
+        const stored = await new Promise(resolve => 
+          chrome.storage.local.get({ microphonePermissionGranted: false }, resolve)
+        );
+        if (stored.microphonePermissionGranted) {
+          return true;
+        }
+        
+        return new Promise((resolve) => {
+          // Create floating dialog
+          const permissionDialog = document.createElement('div');
+          permissionDialog.id = 'mic-permission-dialog';
+          permissionDialog.innerHTML = `
+            <div class="permission-overlay"></div>
+            <div class="permission-dialog">
+              <h2>🎤 麦克风权限</h2>
+              <p>会议助手需要读取麦克风并与 Teams 页面声音混音。</p>
+              <p class="notice">请确保参会者知情并符合公司会议录音和隐私政策。</p>
+              <div class="permission-buttons">
+                <button id="grant-mic-permission" class="primary-btn">允许使用麦克风</button>
+                <button id="deny-mic-permission" class="secondary-btn">暂不允许</button>
+              </div>
+              <div id="permission-status"></div>
+            </div>
+          `;
+          
+          const style = document.createElement('style');
+          style.textContent = `
+            #mic-permission-dialog {
+              position: fixed;
+              top: 0;
+              left: 0;
+              right: 0;
+              bottom: 0;
+              z-index: 10000;
+              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+            .permission-overlay {
+              position: absolute;
+              top: 0;
+              left: 0;
+              right: 0;
+              bottom: 0;
+              background: rgba(0, 0, 0, 0.5);
+              backdrop-filter: blur(2px);
+            }
+            .permission-dialog {
+              position: absolute;
+              top: 50%;
+              left: 50%;
+              transform: translate(-50%, -50%);
+              background: white;
+              padding: 32px;
+              border-radius: 12px;
+              box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+              max-width: 400px;
+              width: 90%;
+              text-align: center;
+            }
+            .permission-dialog h2 {
+              margin: 0 0 16px 0;
+              color: #1a1a1a;
+              font-size: 20px;
+            }
+            .permission-dialog p {
+              margin: 12px 0;
+              color: #4a4a4a;
+              line-height: 1.5;
+              font-size: 14px;
+            }
+            .permission-dialog .notice {
+              background: #fff3cd;
+              padding: 12px;
+              border-radius: 6px;
+              font-size: 13px;
+              color: #856404;
+            }
+            .permission-buttons {
+              display: flex;
+              gap: 12px;
+              justify-content: center;
+              margin-top: 24px;
+            }
+            .permission-buttons button {
+              padding: 10px 20px;
+              border-radius: 6px;
+              font-size: 14px;
+              font-weight: 500;
+              cursor: pointer;
+              transition: all 0.2s;
+              border: none;
+            }
+            .primary-btn {
+              background: #0078d4;
+              color: white;
+            }
+            .primary-btn:hover {
+              background: #106ebe;
+            }
+            .primary-btn:disabled {
+              background: #ccc;
+              cursor: not-allowed;
+            }
+            .secondary-btn {
+              background: #f0f0f0;
+              color: #333;
+            }
+            .secondary-btn:hover {
+              background: #e0e0e0;
+            }
+            #permission-status {
+              margin-top: 16px;
+              font-size: 13px;
+              min-height: 20px;
+            }
+            #permission-status.success {
+              color: #28a745;
+            }
+            #permission-status.error {
+              color: #dc3545;
+            }
+          `;
+          
+          document.head.appendChild(style);
+          document.body.appendChild(permissionDialog);
+          
+          const grantBtn = permissionDialog.querySelector('#grant-mic-permission');
+          const denyBtn = permissionDialog.querySelector('#deny-mic-permission');
+          const statusDiv = permissionDialog.querySelector('#permission-status');
+          
+          grantBtn.addEventListener('click', async () => {
+            grantBtn.disabled = true;
+            let stream;
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+              await chrome.storage.local.set({ microphonePermissionGranted: true });
+              statusDiv.textContent = '✓ 权限已授予。正在启动转写...';
+              statusDiv.className = 'success';
+              stream.getTracks().forEach(track => track.stop());
+              setTimeout(() => {
+                permissionDialog.remove();
+                resolve(true);
+              }, 1500);
+            } catch (error) {
+              const text = error?.name === 'NotAllowedError' 
+                ? '麦克风权限被拒绝，请在浏览器设置中允许。'
+                : `${error?.name || 'Error'}: ${error?.message || error}`;
+              statusDiv.textContent = '✗ ' + text;
+              statusDiv.className = 'error';
+              grantBtn.disabled = false;
+              resolve(false);
+            }
+          });
+          
+          denyBtn.addEventListener('click', async () => {
+            permissionDialog.remove();
+            resolve(false);
+          });
+        });
+      }
+    });
+    return true;
+  } catch (error) {
+    console.error('[Teams ASR] Failed to show permission dialog:', error);
+    return false;
+  }
 }
 
 async function generateMeetingSummary(transcript) {
@@ -478,8 +653,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (!message.muted && !stored.microphonePermissionGranted) {
         // Show floating permission dialog
-        const { requestMicrophonePermission } = await import(chrome.runtime.getURL('permission_floating.js'));
-        const granted = await requestMicrophonePermission();
+        const granted = await openMicrophonePermissionDialog();
         if (!granted) {
           sendResponse({ ok: false, permissionRequired: true });
           return;
@@ -564,6 +738,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         status: "permission-required",
         error: message.error || "麦克风权限未授予。"
       });
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "TEAMS_STATUS_UPDATE") {
+      // Handle status update from content script
+      const inMeeting = message.inMeeting === true;
+      const micMuted = message.micMuted === true;
+      
+      await setState({
+        inTeamsMeeting: inMeeting,
+        teamsMicMuted: micMuted
+      });
+      
+      // If in meeting and running, notify offscreen to reconfigure audio
+      const stored = await chrome.storage.local.get({
+        asrState: DEFAULT_STATE
+      });
+      
+      if (stored.asrState.running && inMeeting) {
+        await chrome.runtime.sendMessage({
+          target: "offscreen",
+          type: "RECONFIGURE_AUDIO",
+          inTeamsMeeting: inMeeting,
+          teamsMicMuted: micMuted
+        }).catch(() => {});
+      }
+      
       sendResponse({ ok: true });
       return;
     }
