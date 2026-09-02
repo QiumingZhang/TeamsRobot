@@ -1,1 +1,1 @@
-Nothing should be ignored based on the provided file changes. The modified files (`background.js` and `offscreen.js`) are source code files that should not be added to .gitignore. Since there are no build artifacts, dependencies, or temporary files in the changes, no additional ignore rules are needed.
+Nothing should be ignored since only JavaScript source files (background.js, offscreen.js) were modified and no build artifacts, dependencies, or temporary files were detected in the changes.

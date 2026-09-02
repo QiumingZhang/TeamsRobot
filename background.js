@@ -90,19 +90,23 @@ async function checkMeetingState(tabId) {
         
         const micButton = document.querySelector('button[data-inp="microphone-button"]');
         let teamsMicOff = false;
+        let micState = 'not-found';
         if (micButton) {
           const dataState = micButton.getAttribute("data-state");
           teamsMicOff = dataState === "mic-off";
+          micState = dataState;
         }
         
-        return { inMeeting, teamsMicOff };
+        return { inMeeting, teamsMicOff, micState };
       }
     });
     
-    return results?.[0]?.result || { inMeeting: false, teamsMicOff: false };
+    const result = results?.[0]?.result || { inMeeting: false, teamsMicOff: false, micState: 'error' };
+    console.log('[background.js] Meeting state check:', result);
+    return result;
   } catch (error) {
     console.error("Failed to check meeting state:", error);
-    return { inMeeting: false, teamsMicOff: false };
+    return { inMeeting: false, teamsMicOff: false, micState: 'error' };
   }
 }
 
@@ -302,19 +306,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           
           // Check if mic state changed
           if (currentState.inMeeting && currentState.teamsMicOff !== newState.teamsMicOff) {
-            console.log('[background.js] Mic state changed:', newState.teamsMicOff ? 'OFF' : 'ON');
             const newMicMuted = newState.teamsMicOff;
+            console.log('[background.js] Mic state changed:', newMicMuted ? 'OFF (muted)' : 'ON (unmuted)', '(teamsMicOff:', newState.teamsMicOff, ')');
             await setState({
               teamsMicOff: newState.teamsMicOff,
               micMuted: newMicMuted
             });
             // Notify offscreen to update mic capture
             await ensureOffscreenDocument();
-            await chrome.runtime.sendMessage({
-              target: "offscreen",
-              type: "SET_MIC_MUTED",
-              muted: newMicMuted
-            });
+            try {
+              await chrome.runtime.sendMessage({
+                target: "offscreen",
+                type: "SET_MIC_MUTED",
+                muted: newMicMuted
+              });
+              console.log('[background.js] Sent SET_MIC_MUTED to offscreen:', newMicMuted);
+            } catch (msgError) {
+              console.error('[background.js] Failed to send SET_MIC_MUTED:', msgError);
+            }
           }
           
           // Update stream ID periodically when in meeting (avoid "active stream" error by checking first)

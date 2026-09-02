@@ -589,7 +589,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === "SET_MIC_MUTED") {
-      await setMicMuted(message.muted);
+      console.log('[offscreen.js] Received SET_MIC_MUTED:', message.muted);
+      // Update settings first
+      currentAudioSettings.micMuted = Boolean(message.muted);
+      currentAudioSettings.teamsMicOff = Boolean(message.muted);
+      
+      if (message.muted) {
+        // Stop microphone when muted
+        stopMicrophone();
+        console.log('[offscreen.js] Microphone stopped (muted by Teams)');
+      } else {
+        // Start microphone when unmuted - need to reconnect to audio graph
+        try {
+          console.log('[offscreen.js] Attempting to restart microphone...');
+          micStream = await createMicStream();
+          if (audioContext && micGainNode && mixGainNode) {
+            micSourceNode = audioContext.createMediaStreamSource(micStream);
+            micSourceNode.connect(micGainNode);
+            micGainNode.connect(mixGainNode);
+            console.log('[offscreen.js] Microphone restarted successfully (unmuted by Teams)');
+          } else {
+            console.error('[offscreen.js] Audio context not ready:', { 
+              hasAudioContext: !!audioContext, 
+              hasMicGainNode: !!micGainNode,
+              hasMixGainNode: !!mixGainNode
+            });
+          }
+        } catch (error) {
+          console.error('[offscreen.js] Failed to restart microphone:', error);
+          throw error;
+        }
+      }
+
+      await updateState({
+        micMuted: currentAudioSettings.micMuted,
+        teamsMicOff: currentAudioSettings.teamsMicOff,
+        inMeeting: currentAudioSettings.inMeeting,
+        status: "recording",
+        error: ""
+      });
       sendResponse({ ok: true });
       return;
     }
