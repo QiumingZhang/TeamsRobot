@@ -9,11 +9,14 @@
     "storage",
     "tabCapture",
     "tabs",
-	"activeTab"
+    "activeTab",
+    "scripting"
   ],
   "host_permissions": [
     "https://teams.microsoft.com/*",
     "https://*.teams.microsoft.com/*",
+    "https://teams.cloud.microsoft/*",
+    "https://*.teams.cloud.microsoft/*",
     "http://ccbdistweb.mfg.hynix-dl.com/*",
     "https://ccbdistweb.mfg.hynix-dl.com/*"
   ],

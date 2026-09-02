@@ -24,7 +24,9 @@ let currentAudioSettings = {
   micGain: 1.0,
   speechThreshold: 0.006,
   silenceDurationMs: 2000,
-  micMuted: false
+  micMuted: false,
+  inMeeting: false,
+  teamsMicOff: false
 };
 
 function updateState(patch) {
@@ -84,7 +86,10 @@ function connectMicrophoneStream() {
 async function startMicrophone() {
   if (micStream) return;
   micStream = await createMicStream();
-  connectMicrophoneStream();
+  // Need to wait for audioContext and micGainNode to be ready
+  if (audioContext && micGainNode) {
+    connectMicrophoneStream();
+  }
 }
 
 function stopMicrophone() {
@@ -105,6 +110,8 @@ async function setMicMuted(muted) {
 
   await updateState({
     micMuted: currentAudioSettings.micMuted,
+    inMeeting: currentAudioSettings.inMeeting,
+    teamsMicOff: currentAudioSettings.teamsMicOff,
     status: "recording",
     error: ""
   });
@@ -177,6 +184,16 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     ...(audioSettings || {})
   };
 
+  const inMeeting = currentAudioSettings.inMeeting || false;
+  const teamsMicOff = currentAudioSettings.teamsMicOff || false;
+  
+  // Determine capture mode:
+  // - In meeting + mic ON: capture both tab and mic
+  // - In meeting + mic OFF: capture only tab (teamsMicOff = true means micMuted = true)
+  // - Not in meeting: capture only mic
+  const captureTabAudio = inMeeting;
+  const captureMicAudio = !inMeeting || (inMeeting && !teamsMicOff);
+
   await updateState({
     running: true,
     status: "requesting-audio",
@@ -185,18 +202,24 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     segments: [],
     language: "",
     audioLevel: 0,
-    micMuted: currentAudioSettings.micMuted,
+    micMuted: !captureMicAudio,
+    inMeeting,
+    teamsMicOff,
     summary: "",
     summaryStatus: "idle",
     error: ""
   });
 
-  tabStream = await createTabStream(streamId);
+  // Create tab stream if needed (in meeting)
+  if (captureTabAudio) {
+    tabStream = await createTabStream(streamId);
+  }
+  
   audioContext = new AudioContext({ latencyHint: "interactive" });
   await audioContext.resume();
   await audioContext.audioWorklet.addModule("pcm-worklet.js");
 
-  tabSourceNode = audioContext.createMediaStreamSource(tabStream);
+  // Set up audio nodes
   tabGainNode = audioContext.createGain();
   micGainNode = audioContext.createGain();
   mixGainNode = audioContext.createGain();
@@ -225,9 +248,31 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     }
   );
 
-  tabSourceNode.connect(tabGainNode);
-  tabGainNode.connect(mixGainNode);
-  micGainNode.connect(mixGainNode);
+  // Connect tab audio source if capturing tab audio
+  if (captureTabAudio && tabStream) {
+    tabSourceNode = audioContext.createMediaStreamSource(tabStream);
+    tabSourceNode.connect(tabGainNode);
+    tabGainNode.connect(mixGainNode);
+    
+    // Preserve normal Teams playback without applying ASR gain
+    tabMonitorNode = audioContext.createGain();
+    tabMonitorNode.gain.value = 1;
+    tabSourceNode.connect(tabMonitorNode);
+    tabMonitorNode.connect(audioContext.destination);
+  }
+
+  // Connect mic source if capturing mic audio
+  if (captureMicAudio) {
+    await startMicrophone();
+    // After micStream is created, connect it to the audio graph
+    if (micStream && audioContext && micGainNode) {
+      micSourceNode = audioContext.createMediaStreamSource(micStream);
+      micSourceNode.connect(micGainNode);
+      micGainNode.connect(mixGainNode);
+    }
+  }
+
+  // Complete the audio chain
   mixGainNode.connect(compressorNode);
   compressorNode.connect(workletNode);
 
@@ -235,16 +280,6 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
   silentSinkNode.gain.value = 0;
   workletNode.connect(silentSinkNode);
   silentSinkNode.connect(audioContext.destination);
-
-  // Preserve normal Teams playback without applying ASR gain.
-  tabMonitorNode = audioContext.createGain();
-  tabMonitorNode.gain.value = 1;
-  tabSourceNode.connect(tabMonitorNode);
-  tabMonitorNode.connect(audioContext.destination);
-
-  if (!currentAudioSettings.micMuted) {
-    await startMicrophone();
-  }
 
   websocket = new WebSocket(wsUrl);
   websocket.binaryType = "arraybuffer";

@@ -2,7 +2,6 @@ const $ = (selector) => document.querySelector(selector);
 
 const startButton = $("#start");
 const stopButton = $("#stop");
-const muteMicButton = $("#muteMic");
 const statusBadge = $("#statusBadge");
 const teamsTab = $("#teamsTab");
 const transcript = $("#transcript");
@@ -23,8 +22,7 @@ const DEFAULT_SETTINGS = {
   tabGain: 3.0,
   micGain: 1.0,
   speechThreshold: 0.006,
-  silenceDurationMs: 2000,
-  micMuted: false
+  silenceDurationMs: 2000
 };
 
 const DEFAULT_STATE = {
@@ -36,6 +34,8 @@ const DEFAULT_STATE = {
   language: "",
   audioLevel: 0,
   micMuted: false,
+  inMeeting: false,
+  teamsMicOff: false,
   teamsTabTitle: "",
   summary: "",
   summaryStatus: "idle",
@@ -78,8 +78,7 @@ function readSettings() {
     tabGain: Number(tabGain.value),
     micGain: Number(micGain.value),
     speechThreshold: Number(threshold.value),
-    silenceDurationMs: Number(silenceDuration.value),
-    micMuted: muteMicButton.dataset.muted === "true"
+    silenceDurationMs: Number(silenceDuration.value)
   };
 }
 
@@ -89,9 +88,6 @@ function renderSettings(settings) {
   micGain.value = String(safe.micGain);
   threshold.value = String(safe.speechThreshold);
   silenceDuration.value = String(safe.silenceDurationMs);
-  muteMicButton.dataset.muted = String(Boolean(safe.micMuted));
-  muteMicButton.textContent = safe.micMuted ? "恢复麦克风" : "静音麦克风";
-  muteMicButton.classList.toggle("muted", safe.micMuted);
   tabGainValue.textContent = `${safe.tabGain.toFixed(1)}x`;
   micGainValue.textContent = `${safe.micGain.toFixed(1)}x`;
   thresholdValue.textContent = safe.speechThreshold.toFixed(3);
@@ -114,9 +110,6 @@ function renderState(input) {
   );
   language.textContent = state.language || "";
   audioLevel.value = Math.min(0.1, Number(state.audioLevel) || 0);
-  muteMicButton.dataset.muted = String(Boolean(state.micMuted));
-  muteMicButton.textContent = state.micMuted ? "恢复麦克风" : "静音麦克风";
-  muteMicButton.classList.toggle("muted", state.micMuted);
 
   if (state.error) {
     errorBox.hidden = false;
@@ -156,7 +149,6 @@ startButton.addEventListener("click", async () => {
       type: "START_MEETING_CAPTURE",
       audioSettings: settings
     });
-    if (response?.permissionRequired) return;
     if (!response?.ok) throw new Error(response?.error || "启动失败。");
   } catch (error) {
     errorBox.hidden = false;
@@ -174,24 +166,6 @@ stopButton.addEventListener("click", async () => {
     errorBox.hidden = false;
     errorBox.textContent = error?.message || String(error);
   }
-});
-
-muteMicButton.addEventListener("click", async () => {
-  const muted = muteMicButton.dataset.muted !== "true";
-  const stored = await chrome.storage.local.get({ asrState: DEFAULT_STATE });
-
-  if (stored.asrState.running) {
-    const response = await chrome.runtime.sendMessage({
-      type: "SET_MIC_MUTED",
-      muted
-    });
-    if (response?.permissionRequired) return;
-    if (!response?.ok) throw new Error(response?.error || "麦克风切换失败。");
-  }
-
-  const settings = { ...readSettings(), micMuted: muted };
-  await chrome.storage.local.set({ audioSettings: settings });
-  renderSettings(settings);
 });
 
 for (const control of [tabGain, micGain, threshold, silenceDuration]) {
