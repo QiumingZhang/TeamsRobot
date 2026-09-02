@@ -84,12 +84,13 @@ function connectMicrophoneStream() {
 }
 
 async function startMicrophone() {
-  if (micStream) return;
+  if (micStream) return micStream;
   micStream = await createMicStream();
   // Need to wait for audioContext and micGainNode to be ready
   if (audioContext && micGainNode) {
     connectMicrophoneStream();
   }
+  return micStream;
 }
 
 function stopMicrophone() {
@@ -253,23 +254,41 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     tabSourceNode = audioContext.createMediaStreamSource(tabStream);
     tabSourceNode.connect(tabGainNode);
     tabGainNode.connect(mixGainNode);
+    console.log('[offscreen.js] Tab audio connected');
     
     // Preserve normal Teams playback without applying ASR gain
     tabMonitorNode = audioContext.createGain();
     tabMonitorNode.gain.value = 1;
     tabSourceNode.connect(tabMonitorNode);
     tabMonitorNode.connect(audioContext.destination);
+  } else {
+    console.log('[offscreen.js] Tab audio not captured (not in meeting)');
   }
 
   // Connect mic source if capturing mic audio
   if (captureMicAudio) {
     await startMicrophone();
     // After micStream is created, connect it to the audio graph
+    // Ensure proper connection sequence
     if (micStream && audioContext && micGainNode) {
       micSourceNode = audioContext.createMediaStreamSource(micStream);
       micSourceNode.connect(micGainNode);
       micGainNode.connect(mixGainNode);
+      console.log('[offscreen.js] Mic audio connected:', { 
+        hasMicStream: !!micStream, 
+        hasAudioContext: !!audioContext,
+        hasMicGainNode: !!micGainNode,
+        captureMicAudio 
+      });
+    } else {
+      console.error('[offscreen.js] Failed to connect mic audio:', { 
+        hasMicStream: !!micStream, 
+        hasAudioContext: !!audioContext,
+        hasMicGainNode: !!micGainNode 
+      });
     }
+  } else {
+    console.log('[offscreen.js] Mic audio not captured (teamsMicOff or not in meeting)');
   }
 
   // Complete the audio chain

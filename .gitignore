@@ -1,18 +1,1 @@
-```
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-
-# Environment
-.env
-.env.local
-.env.
-
-# Editors
-.vscode/
-.idea/
-
-# Dependencies
-node_modules/
-```
+Nothing should be ignored based on the provided file changes, as they only include source code and configuration files (.js, .css, .html).

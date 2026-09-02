@@ -4,6 +4,7 @@ const startButton = $("#start");
 const stopButton = $("#stop");
 const statusBadge = $("#statusBadge");
 const teamsTab = $("#teamsTab");
+const micStatusText = $("#micStatusText");
 const transcript = $("#transcript");
 const summary = $("#summary");
 const language = $("#language");
@@ -103,6 +104,19 @@ function renderState(input) {
   teamsTab.textContent = state.teamsTabTitle
     ? `Teams：${state.teamsTabTitle}`
     : "自动选择正在播放声音的 Teams 标签页";
+  
+  // Update microphone status display
+  if (state.inMeeting && state.teamsMicOff) {
+    micStatusText.textContent = "关闭 (Teams 中静音)";
+    micStatusText.style.color = "#dc3545";
+  } else if (state.inMeeting && !state.teamsMicOff) {
+    micStatusText.textContent = "打开";
+    micStatusText.style.color = "#28a745";
+  } else {
+    micStatusText.textContent = "打开 (仅麦克风模式)";
+    micStatusText.style.color = "#28a745";
+  }
+  
   transcript.value = buildTranscript(state);
   transcript.scrollTop = transcript.scrollHeight;
   summary.value = state.summary || (
