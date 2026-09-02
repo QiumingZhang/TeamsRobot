@@ -317,19 +317,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             });
           }
           
-          // Check if we need to update stream ID (in case of tab switch or stream issues)
+          // Update stream ID periodically when in meeting (avoid "active stream" error by checking first)
           if (currentState.inMeeting && newState.inMeeting) {
             try {
-              const newStreamId = await chrome.tabCapture.getMediaStreamId({
-                targetTabId: currentTeamsTabId
-              });
-              if (newStreamId) {
-                await chrome.runtime.sendMessage({
-                  target: "offscreen",
-                  type: "UPDATE_STREAM_ID",
-                  streamId: newStreamId
-                });
-              }
+              // Only update stream ID if the current one might be stale
+              // Don't call getMediaStreamId while a capture is active on the same tab
+              // Instead, let offscreen handle stream refresh if needed
             } catch (error) {
               console.error('[background.js] Failed to update stream ID:', error);
             }

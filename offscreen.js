@@ -238,6 +238,9 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     }
   } else if (captureTabAudio && !streamId) {
     console.warn('[offscreen.js] Tab audio requested but no streamId provided');
+    throw new Error('会议模式下需要有效的 streamId');
+  } else if (!captureTabAudio) {
+    console.log('[offscreen.js] Tab audio not captured (not in meeting)');
   }
   
   audioContext = new AudioContext({ latencyHint: "interactive" });
@@ -285,8 +288,11 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     tabMonitorNode.gain.value = 1;
     tabSourceNode.connect(tabMonitorNode);
     tabMonitorNode.connect(audioContext.destination);
+  } else if (captureTabAudio && !tabStream) {
+    console.error('[offscreen.js] Tab audio requested but tabStream is null');
+    throw new Error('会议模式下标签页音频流创建失败');
   } else {
-    console.log('[offscreen.js] Tab audio not captured (not in meeting or no streamId)');
+    console.log('[offscreen.js] Tab audio not captured (not in meeting)');
   }
 
   // Connect mic source if capturing mic audio
@@ -572,8 +578,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "STOP_CAPTURE") {
       await stopCapture();
-      // Clear polling state
-      currentTeamsTabId = null;
       sendResponse({ ok: true });
       return;
     }
@@ -586,13 +590,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "SET_MIC_MUTED") {
       await setMicMuted(message.muted);
-      sendResponse({ ok: true });
-      return;
-    }
-
-    // Handle dynamic stream ID update when meeting state changes
-    if (message.type === "UPDATE_STREAM_ID") {
-      currentStreamId = message.streamId;
       sendResponse({ ok: true });
       return;
     }
