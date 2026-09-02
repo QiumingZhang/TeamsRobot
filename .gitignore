@@ -1,1 +1,1 @@
-Nothing should be ignored based on the provided file changes, as they only include source code and configuration files (.js, .css, .html).
+Nothing needs to be added to the .gitignore file based on the provided file changes, as they only include JavaScript source files (background.js, offscreen.js, popup.js) which should not be ignored.

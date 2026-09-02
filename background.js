@@ -35,6 +35,9 @@ const DEFAULT_STATE = {
   error: ""
 };
 
+let meetingStatePoller = null;
+let currentTeamsTabId = null;
+
 async function ensureOffscreenDocument() {
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ["OFFSCREEN_DOCUMENT"],
@@ -104,6 +107,12 @@ async function checkMeetingState(tabId) {
 }
 
 async function generateMeetingSummary(transcript) {
+  // Stop polling when stopping capture
+  if (meetingStatePoller) {
+    clearInterval(meetingStatePoller);
+    meetingStatePoller = null;
+  }
+  
   const cleanText = (transcript || "").trim();
   if (!cleanText) {
     await setState({
@@ -201,6 +210,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!teamsTab.id) {
         throw new Error("未找到已打开的网页版 Teams 标签页。");
       }
+      
+      currentTeamsTabId = teamsTab.id;
 
       // Check meeting state and microphone status from Teams page
       const meetingState = await checkMeetingState(teamsTab.id);
@@ -253,12 +264,93 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!result?.ok) {
         throw new Error(result?.error || "无法启动会议音频捕获。");
       }
+      
+      // Start polling for meeting state changes (mic on/off, meeting end)
+      if (meetingStatePoller) {
+        clearInterval(meetingStatePoller);
+      }
+      meetingStatePoller = setInterval(async () => {
+        if (!currentTeamsTabId) {
+          return;
+        }
+        try {
+          const newState = await checkMeetingState(currentTeamsTabId);
+          const stored = await chrome.storage.local.get({ asrState: DEFAULT_STATE });
+          const currentState = stored.asrState || DEFAULT_STATE;
+          
+          // Check if meeting ended
+          if (currentState.inMeeting && !newState.inMeeting) {
+            console.log('[background.js] Meeting ended detected');
+            await setState({
+              inMeeting: false,
+              teamsMicOff: false,
+              micMuted: false
+            });
+            // Notify offscreen to switch to mic-only mode
+            await ensureOffscreenDocument();
+            await chrome.runtime.sendMessage({
+              target: "offscreen",
+              type: "UPDATE_AUDIO_SETTINGS",
+              settings: {
+                inMeeting: false,
+                teamsMicOff: false,
+                micMuted: false
+              }
+            });
+            return;
+          }
+          
+          // Check if mic state changed
+          if (currentState.inMeeting && currentState.teamsMicOff !== newState.teamsMicOff) {
+            console.log('[background.js] Mic state changed:', newState.teamsMicOff ? 'OFF' : 'ON');
+            const newMicMuted = newState.teamsMicOff;
+            await setState({
+              teamsMicOff: newState.teamsMicOff,
+              micMuted: newMicMuted
+            });
+            // Notify offscreen to update mic capture
+            await ensureOffscreenDocument();
+            await chrome.runtime.sendMessage({
+              target: "offscreen",
+              type: "SET_MIC_MUTED",
+              muted: newMicMuted
+            });
+          }
+          
+          // Check if we need to update stream ID (in case of tab switch or stream issues)
+          if (currentState.inMeeting && newState.inMeeting) {
+            try {
+              const newStreamId = await chrome.tabCapture.getMediaStreamId({
+                targetTabId: currentTeamsTabId
+              });
+              if (newStreamId) {
+                await chrome.runtime.sendMessage({
+                  target: "offscreen",
+                  type: "UPDATE_STREAM_ID",
+                  streamId: newStreamId
+                });
+              }
+            } catch (error) {
+              console.error('[background.js] Failed to update stream ID:', error);
+            }
+          }
+        } catch (error) {
+          console.error('[background.js] Polling error:', error);
+        }
+      }, 2000); // Poll every 2 seconds
 
       sendResponse({ ok: true });
       return;
     }
 
     if (message.type === "STOP_MEETING_CAPTURE") {
+      // Stop polling when stopping capture
+      if (meetingStatePoller) {
+        clearInterval(meetingStatePoller);
+        meetingStatePoller = null;
+      }
+      currentTeamsTabId = null;
+      
       await ensureOffscreenDocument();
       const result = await chrome.runtime.sendMessage({
         target: "offscreen",

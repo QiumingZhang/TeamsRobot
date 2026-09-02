@@ -14,6 +14,7 @@ let tabMonitorNode = null;
 let stopping = false;
 let cleanupTimer = null;
 let lastLevelUpdate = 0;
+let currentStreamId = null;
 
 let committedSegments = [];
 let committedText = "";
@@ -104,9 +105,23 @@ async function setMicMuted(muted) {
   currentAudioSettings.micMuted = Boolean(muted);
 
   if (muted) {
+    // Stop microphone when muted
     stopMicrophone();
+    console.log('[offscreen.js] Microphone stopped (muted)');
   } else {
-    await startMicrophone();
+    // Start microphone when unmuted - need to reconnect to audio graph
+    try {
+      micStream = await createMicStream();
+      if (audioContext && micGainNode) {
+        micSourceNode = audioContext.createMediaStreamSource(micStream);
+        micSourceNode.connect(micGainNode);
+        micGainNode.connect(mixGainNode);
+        console.log('[offscreen.js] Microphone restarted (unmuted)');
+      }
+    } catch (error) {
+      console.error('[offscreen.js] Failed to restart microphone:', error);
+      throw error;
+    }
   }
 
   await updateState({
@@ -180,6 +195,7 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
   committedSegments = [];
   committedText = "";
   currentPartialText = "";
+  currentStreamId = streamId;
   currentAudioSettings = {
     ...currentAudioSettings,
     ...(audioSettings || {})
@@ -212,8 +228,16 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
   });
 
   // Create tab stream if needed (in meeting)
-  if (captureTabAudio) {
-    tabStream = await createTabStream(streamId);
+  if (captureTabAudio && streamId) {
+    try {
+      tabStream = await createTabStream(streamId);
+      console.log('[offscreen.js] Tab stream created successfully');
+    } catch (error) {
+      console.error('[offscreen.js] Failed to create tab stream:', error);
+      throw new Error('无法捕获标签页音频：' + error.message);
+    }
+  } else if (captureTabAudio && !streamId) {
+    console.warn('[offscreen.js] Tab audio requested but no streamId provided');
   }
   
   audioContext = new AudioContext({ latencyHint: "interactive" });
@@ -262,30 +286,38 @@ async function startCapture({ streamId, wsUrl, audioSettings }) {
     tabSourceNode.connect(tabMonitorNode);
     tabMonitorNode.connect(audioContext.destination);
   } else {
-    console.log('[offscreen.js] Tab audio not captured (not in meeting)');
+    console.log('[offscreen.js] Tab audio not captured (not in meeting or no streamId)');
   }
 
   // Connect mic source if capturing mic audio
   if (captureMicAudio) {
-    await startMicrophone();
-    // After micStream is created, connect it to the audio graph
-    // Ensure proper connection sequence
-    if (micStream && audioContext && micGainNode) {
-      micSourceNode = audioContext.createMediaStreamSource(micStream);
-      micSourceNode.connect(micGainNode);
-      micGainNode.connect(mixGainNode);
-      console.log('[offscreen.js] Mic audio connected:', { 
-        hasMicStream: !!micStream, 
-        hasAudioContext: !!audioContext,
-        hasMicGainNode: !!micGainNode,
-        captureMicAudio 
-      });
-    } else {
-      console.error('[offscreen.js] Failed to connect mic audio:', { 
-        hasMicStream: !!micStream, 
-        hasAudioContext: !!audioContext,
-        hasMicGainNode: !!micGainNode 
-      });
+    try {
+      await startMicrophone();
+      // After micStream is created, connect it to the audio graph
+      // Ensure proper connection sequence
+      if (micStream && audioContext && micGainNode) {
+        micSourceNode = audioContext.createMediaStreamSource(micStream);
+        micSourceNode.connect(micGainNode);
+        micGainNode.connect(mixGainNode);
+        console.log('[offscreen.js] Mic audio connected:', { 
+          hasMicStream: !!micStream, 
+          hasAudioContext: !!audioContext,
+          hasMicGainNode: !!micGainNode,
+          captureMicAudio,
+          inMeeting,
+          teamsMicOff
+        });
+      } else {
+        console.error('[offscreen.js] Failed to connect mic audio:', { 
+          hasMicStream: !!micStream, 
+          hasAudioContext: !!audioContext,
+          hasMicGainNode: !!micGainNode 
+        });
+        throw new Error('麦克风音频连接失败');
+      }
+    } catch (error) {
+      console.error('[offscreen.js] Microphone capture failed:', error);
+      throw new Error('无法捕获麦克风音频：' + error.message);
     }
   } else {
     console.log('[offscreen.js] Mic audio not captured (teamsMicOff or not in meeting)');
@@ -524,6 +556,7 @@ async function cleanup(closeSocket) {
   silentSinkNode = null;
   tabMonitorNode = null;
   audioContext = null;
+  currentStreamId = null;
   if (closeSocket) websocket = null;
 }
 
@@ -539,6 +572,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "STOP_CAPTURE") {
       await stopCapture();
+      // Clear polling state
+      currentTeamsTabId = null;
       sendResponse({ ok: true });
       return;
     }
@@ -551,6 +586,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "SET_MIC_MUTED") {
       await setMicMuted(message.muted);
+      sendResponse({ ok: true });
+      return;
+    }
+
+    // Handle dynamic stream ID update when meeting state changes
+    if (message.type === "UPDATE_STREAM_ID") {
+      currentStreamId = message.streamId;
       sendResponse({ ok: true });
       return;
     }
